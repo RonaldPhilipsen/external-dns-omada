@@ -1,0 +1,79 @@
+# external-dns talks to the Omada provider through its built-in webhook
+# provider (docs/tutorials/webhook-provider.md upstream). The webhook
+# listener must stay on localhost inside the pod, so the provider runs as a
+# sidecar of the external-dns container, not as a separate Deployment.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: external-dns-omada
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: external-dns-omada
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: external-dns-omada
+    spec:
+      serviceAccountName: external-dns
+      containers:
+        - name: external-dns
+          image: registry.k8s.io/external-dns/external-dns:v0.23.0
+          args:
+            - --provider=webhook
+            - --webhook-provider-url=http://localhost:8888
+            - --source=gateway-httproute
+            - --source=service
+            - --domain-filter=rphilipsen.nl
+            - --policy=upsert-only
+            # The Omada controller cannot store the TXT records the txt
+            # registry uses, so run without an ownership registry; the
+            # upsert-only policy keeps manual entries safe.
+            - --registry=noop
+        - name: omada-webhook
+          image: ghcr.io/ronaldphilipsen/external-dns-omada:v0.1.0
+          env:
+            - name: OMADA_SERVER
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-omada
+                  key: OMADA_SERVER
+            - name: OMADA_ID
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-omada
+                  key: OMADA_ID
+            - name: OMADA_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-omada
+                  key: OMADA_CLIENT_ID
+            - name: OMADA_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-omada
+                  key: OMADA_CLIENT_SECRET
+            - name: OMADA_SITE_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-omada
+                  key: OMADA_SITE_NAME
+            - name: OMADA_TLS_SKIP_VERIFY
+              valueFrom:
+                secretKeyRef:
+                  name: external-dns-omada
+                  key: OMADA_TLS_SKIP_VERIFY
+            # Attach managed entries to these LAN networks only.
+            - name: OMADA_NETWORKS
+              value: "Default,IOT,K8s"
+            # Kept in sync with --domain-filter above.
+            - name: DOMAIN_FILTER
+              value: "rphilipsen.nl"
+          ports:
+            - name: metrics
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: metrics

@@ -1,0 +1,6 @@
+bin/
+*.out
+coverage.html
+.DS_Store
+.idea/
+.vscode/

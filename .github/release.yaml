@@ -42,13 +42,13 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      - name: Setup Go 1.25.8
+      - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: 1.27.1
+          go-version-file: go.mod
 
-      - name: Install dependencies
-        run: go get .
+      - name: Download dependencies
+        run: go mod download
 
       - name: Build
         env:
@@ -59,26 +59,24 @@ jobs:
         run: |
           go build \
             -ldflags="-s -w -extldflags '-static' -X 'main.BuildVersion=$VERSION' -X 'main.BuildCommitSha=$GIT_SHA'" \
-            -o dist/gaggiuino-exporter
+            -o dist/external-dns-omada
 
       - name: Tag Release
         env:
           TAG: ${{ needs.version.outputs.tag }}
-          GITHUB_TOKEN: ${{ secrets.TAG_PUSH_PAT }}
         run: |
           git tag "$TAG"
-          git remote set-url origin https://x-access-token:$GITHUB_TOKEN@github.com/${{ github.repository }}
+          git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
           git push origin "$TAG"
 
       - name: Create Release
         env:
-          GH_TOKEN: ${{ secrets.TAG_PUSH_PAT }}
           TAG: ${{ needs.version.outputs.tag }}
           RELEASE_NOTES: ${{ needs.version.outputs.release_notes }}
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
         run: |
           if [ "$PRERELEASE" = 'true' ]; then
-            gh release create "$TAG" --title "$TAG" --notes "$RELEASE_NOTES" --prerelease dist/gaggiuino-exporter
+            gh release create "$TAG" --title "$TAG" --notes "$RELEASE_NOTES" --prerelease dist/external-dns-omada
           else
-            gh release create "$TAG" --title "$TAG" --notes "$RELEASE_NOTES" dist/gaggiuino-exporter
+            gh release create "$TAG" --title "$TAG" --notes "$RELEASE_NOTES" dist/external-dns-omada
           fi
