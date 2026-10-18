@@ -14,7 +14,7 @@ import (
 	"strings"
 	"sync"
 
-	extdnshttp "sigs.k8s.io/external-dns/pkg/http"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 const (
@@ -122,11 +122,11 @@ func newClient(ctx context.Context, server, omadaID, clientID, clientSecret, sit
 	if err != nil {
 		return nil, fmt.Errorf("omada: invalid server URL %q: %w", server, err)
 	}
-	httpClient := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: tlsInsecureSkipVerify,
-			},
+	// otelhttp wraps the base transport so every API call produces a
+	// client span; TLS behavior stays on the base transport.
+	baseTransport := &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: tlsInsecureSkipVerify,
 		},
 	}
 	cl := &omadaClient{
@@ -134,7 +134,9 @@ func newClient(ctx context.Context, server, omadaID, clientID, clientSecret, sit
 		omadaID:      omadaID,
 		clientID:     clientID,
 		clientSecret: clientSecret,
-		httpClient:   extdnshttp.NewInstrumentedClient(httpClient),
+		httpClient: &http.Client{
+			Transport: otelhttp.NewTransport(baseTransport),
+		},
 	}
 	if err := cl.authorize(ctx); err != nil {
 		return nil, fmt.Errorf("omada: authorize: %w", err)
