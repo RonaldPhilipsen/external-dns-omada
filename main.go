@@ -51,7 +51,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	provider, err := omada.New(ctx, cfg.Omada)
+	provider, err := omada.New(ctx, cfg.Omada, omada.NoopTelemetry())
 	if err != nil {
 		return fmt.Errorf("initializing omada provider: %w", err)
 	}
