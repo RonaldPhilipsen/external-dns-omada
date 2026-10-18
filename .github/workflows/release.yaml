@@ -64,6 +64,7 @@ jobs:
       - name: Tag Release
         env:
           TAG: ${{ needs.version.outputs.tag }}
+          GITHUB_TOKEN: ${{ secrets.TAG_PUSH_PAT }}
         run: |
           git tag "$TAG"
           git remote set-url origin https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}
@@ -71,6 +72,7 @@ jobs:
 
       - name: Create Release
         env:
+          GH_TOKEN: ${{ secrets.TAG_PUSH_PAT }}
           TAG: ${{ needs.version.outputs.tag }}
           RELEASE_NOTES: ${{ needs.version.outputs.release_notes }}
           PRERELEASE: ${{ needs.version.outputs.prerelease }}
