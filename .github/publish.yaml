@@ -1,0 +1,107 @@
+name: Publish
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Release tag to publish (for example v1.1.0)
+        required: true
+        type: string
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: publish-${{ github.repository }}-${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
+      cancel-in-progress: false
+    permissions:
+      contents: read # Required for repository checkout
+      attestations: write # Required for artifact attestations
+      id-token: write # Required for artifact attestations
+      packages: write # Required for pushing the Docker image to GitHub Packages
+
+    steps:
+      - name: Resolve target tag
+        id: target
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_RELEASE_TAG: ${{ inputs.release_tag }}
+          EVENT_RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            echo "tag=$INPUT_RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          elif [ "$EVENT_NAME" = "release" ]; then
+            echo "tag=$EVENT_RELEASE_TAG" >> "$GITHUB_OUTPUT"
+          else
+            echo "Unsupported event: $EVENT_NAME"
+            exit 1
+          fi
+
+      - name: Validate release tag input
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          if ! printf '%s\n' "$TARGET_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)*$'; then
+            echo "Invalid release_tag: '$TARGET_TAG'. Expected a semver-like tag such as v1.2.3 or v1.2.3-rc.1."
+            exit 1
+          fi
+
+      - name: Verify release exists
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET_TAG: ${{ steps.target.outputs.tag }}
+        run: |
+          gh release view "$TARGET_TAG" --repo "${{ github.repository }}" >/dev/null
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+          ref: ${{ steps.target.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags, labels) for Docker
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.target.outputs.tag }}
+
+      - name: Build and push Docker image
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.target.outputs.tag }}
+            GIT_SHA=${{ github.sha }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME}}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
