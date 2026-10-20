@@ -56,6 +56,10 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("initializing telemetry: %w", err)
 	}
+	// The explicit shutdown at the end of run() remains the primary path;
+	// this deferral covers early returns (e.g. provider init failure) so
+	// batched spans are still flushed.
+	defer func() { _ = tel.Shutdown(context.Background()) }()
 
 	provider, err := omada.New(ctx, cfg.Omada, omada.Telemetry{
 		Tracer: tel.Tracer("omada"),

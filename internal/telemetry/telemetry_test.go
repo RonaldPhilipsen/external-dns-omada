@@ -46,6 +46,13 @@ func TestInitTracesDisabledMetricsOn(t *testing.T) {
 	tel, err := Init(context.Background(), "test-version")
 	require.NoError(t, err)
 	assert.NotNil(t, tel.Meter("x"))
+	families, gerr := tel.Registry().Gather()
+	require.NoError(t, gerr)
+	names := map[string]bool{}
+	for _, mf := range families {
+		names[mf.GetName()] = true
+	}
+	assert.True(t, names["go_goroutines"], "the /metrics registry must be populated even with traces disabled")
 	shutdown(t, tel)
 }
 
@@ -55,6 +62,15 @@ func TestInitDefaultsUnreachableCollector(t *testing.T) {
 	tel, err := Init(context.Background(), "test-version")
 	require.NoError(t, err, "an unreachable collector must not prevent startup")
 	shutdown(t, tel)
+}
+
+func TestInitBadProtocolNamesTheSuppliedVariable(t *testing.T) {
+	t.Setenv("OTEL_EXPORTER_OTLP_PROTOCOL", "carrier-pigeon")
+
+	_, err := Init(context.Background(), "test-version")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "OTEL_EXPORTER_OTLP_PROTOCOL")
+	assert.NotContains(t, err.Error(), "OTEL_EXPORTER_OTLP_TRACES_PROTOCOL")
 }
 
 func TestInitHTTPProtocol(t *testing.T) {

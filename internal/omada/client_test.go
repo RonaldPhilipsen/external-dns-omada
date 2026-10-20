@@ -13,8 +13,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-
-	extdnshttp "sigs.k8s.io/external-dns/pkg/http"
 )
 
 func newTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
@@ -999,7 +997,7 @@ func TestNetworkError(t *testing.T) {
 		baseURL:    "https://controller.example.test",
 		omadaID:    "test-omada-id",
 		siteID:     "site-abc",
-		httpClient: extdnshttp.NewInstrumentedClient(&http.Client{Transport: errorTransport{}}),
+		httpClient: &http.Client{Transport: errorTransport{}},
 	}
 	_, err := cl.listLanDNS(t.Context())
 	if err == nil {

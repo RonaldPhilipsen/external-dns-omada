@@ -270,6 +270,10 @@ func TestExposedEndpoints(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, string(metricsBody), "go_goroutines")
 	assert.NotContains(t, string(metricsBody), "external_dns_build_info")
+	// The line-start anchor keeps the old extdnshttp summary series
+	// (request_duration_seconds) distinct from the bridged
+	// http_server_request_duration_seconds, which contains it as a substring.
+	assert.NotContains(t, string(metricsBody), "\nrequest_duration_seconds")
 }
 
 func TestUnknownPathFallsBackToNegotiate(t *testing.T) {

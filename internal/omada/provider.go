@@ -377,6 +377,7 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 	)
 	current, err := p.currentState(ctx)
 	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
 		return err
 	}
 	var errs []error
