@@ -115,9 +115,11 @@ What is emitted:
 
 - a server span per webhook request, and per `/healthz` and `/metrics`
   request;
-- a client span per Omada API call — auth/refresh, site and network
-  resolution, LAN DNS list pages, create/update/delete — with method, path,
-  and response status;
+- a client span per Omada API call — site and network resolution, LAN DNS
+  list pages, create/update/delete — with method, path, and response status.
+  Auth and token-refresh requests are not traced: the controller requires
+  the client credentials and refresh token in the refresh request's URL
+  query, and span attributes must never carry credentials;
 - an `omada.ApplyChanges` span per reconcile batch with the planned
   create/update/delete counts and the dry-run flag, marked as an error when
   the batch fails;

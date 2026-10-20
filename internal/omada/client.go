@@ -123,7 +123,10 @@ func newClient(ctx context.Context, server, omadaID, clientID, clientSecret, sit
 		return nil, fmt.Errorf("omada: invalid server URL %q: %w", server, err)
 	}
 	// otelhttp wraps the base transport so every API call produces a
-	// client span; TLS behavior stays on the base transport.
+	// client span; TLS behavior stays on the base transport. The auth
+	// endpoint is excluded: the controller requires client_secret and
+	// refresh_token as query parameters on token refresh, and span
+	// attributes must never carry credentials.
 	baseTransport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: tlsInsecureSkipVerify,
@@ -135,7 +138,8 @@ func newClient(ctx context.Context, server, omadaID, clientID, clientSecret, sit
 		clientID:     clientID,
 		clientSecret: clientSecret,
 		httpClient: &http.Client{
-			Transport: otelhttp.NewTransport(baseTransport),
+			Transport: otelhttp.NewTransport(baseTransport, otelhttp.WithFilter(
+				func(r *http.Request) bool { return r.URL.Path != authPath })),
 		},
 	}
 	if err := cl.authorize(ctx); err != nil {
