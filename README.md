@@ -104,6 +104,57 @@ external-dns-omada \
 Then point an ExternalDNS instance at it with
 `--provider=webhook --webhook-provider-url=http://localhost:8888`.
 
+## Telemetry
+
+Traces and metrics are exported to an OpenTelemetry collector over OTLP,
+configured by the standard `OTEL_*` environment variables — no flags. A
+missing or unreachable collector never prevents startup; the exporter drops
+its batches in the background (SDK-internal errors go to stderr).
+
+What is emitted:
+
+- a server span per webhook request, and per `/healthz` and `/metrics`
+  request;
+- a client span per Omada API call — auth/refresh, site and network
+  resolution, LAN DNS list pages, create/update/delete — with method, path,
+  and response status;
+- an `omada.ApplyChanges` span per reconcile batch with the planned
+  create/update/delete counts and the dry-run flag, marked as an error when
+  the batch fails;
+- the `omada.dns.entries` gauge (entries the provider last reported), the
+  `omada.dns.changes` counter (`created`/`updated`/`deleted`/`skipped`/
+  `dry_run`), and the `omada.dns.errors` counter (`list`/`create`/`update`/
+  `delete`/`validate`), plus the OTel HTTP server and client duration
+  metrics.
+
+| Env | Default | Effect |
+|-----|---------|--------|
+| `OTEL_SERVICE_NAME` | `external-dns-omada` | `service.name` resource attribute |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` / `..._TRACES_ENDPOINT` / `..._METRICS_ENDPOINT` | `http://localhost:4317` | collector endpoint |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | `grpc` | `grpc` (4317) or `http/protobuf` (4318) |
+| `OTEL_EXPORTER_OTLP_HEADERS` | — | auth headers if the collector needs them |
+| `OTEL_TRACES_EXPORTER` / `OTEL_METRICS_EXPORTER` | `otlp` | set to `none` to disable one signal |
+| `OTEL_METRIC_EXPORT_INTERVAL` | `60s` | OTLP metric export interval |
+
+`/metrics` also serves the OTel-bridged metrics in Prometheus format
+alongside the `go_*`/`process_*` runtime series, so existing scrapers keep
+working. The only series removed from the endpoint are the Omada
+HTTP-client duration summary (superseded by `http.client.request.duration`)
+and `external_dns_build_info`.
+
+```yaml
+env:
+  # OTLP gRPC is the default protocol.
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability.svc:4317
+# For an HTTP collector on 4318, add these instead:
+env:
+  - name: OTEL_EXPORTER_OTLP_ENDPOINT
+    value: http://otel-collector.observability.svc:4318
+  - name: OTEL_EXPORTER_OTLP_PROTOCOL
+    value: http/protobuf
+```
+
 ## Building
 
 ```sh
@@ -125,6 +176,7 @@ The layout:
 |---------|---------|
 | `internal/config` | Flag + env parsing and validation |
 | `internal/omada` | Omada OpenAPI client (`client.go`) and the provider (`provider.go`) |
+| `internal/telemetry` | OTel SDK setup: OTLP trace/metric export, /metrics Prometheus bridge |
 | `internal/webhook` | The webhook HTTP server and its handler wiring |
 | `internal/sets` | Small generic set helper |
 

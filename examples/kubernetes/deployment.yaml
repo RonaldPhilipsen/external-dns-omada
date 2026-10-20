@@ -70,6 +70,12 @@ spec:
             # Kept in sync with --domain-filter above.
             - name: DOMAIN_FILTER
               value: "rphilipsen.nl"
+            # OpenTelemetry (optional): export traces and metrics to the
+            # collector over OTLP gRPC on 4317 by default; set
+            # OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf for an HTTP
+            # collector on 4318.
+            # - name: OTEL_EXPORTER_OTLP_ENDPOINT
+            #   value: http://otel-collector.observability.svc:4317
           ports:
             - name: metrics
               containerPort: 8080
