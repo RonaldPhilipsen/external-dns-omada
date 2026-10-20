@@ -83,11 +83,19 @@ func (f *fakeAPI) deleteLanDNS(_ context.Context, id string) error {
 
 func newTestProvider(t *testing.T, api omadaAPI) *Provider {
 	t.Helper()
-	return &Provider{
+	return newTestProviderWithTelemetry(t, api, NoopTelemetry())
+}
+
+func newTestProviderWithTelemetry(t *testing.T, api omadaAPI, tel Telemetry) *Provider {
+	t.Helper()
+	p := &Provider{
 		BaseProvider: provider.BaseProvider{},
 		api:          api,
 		domainFilter: endpoint.MatchAllDomainFilters{},
+		tel:          tel,
 	}
+	require.NoError(t, p.initInstruments())
+	return p
 }
 
 func epA(fqdn string, ips ...string) *endpoint.Endpoint {
@@ -444,7 +452,7 @@ func TestNewValidation(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := base
 			tc.mutate(&cfg)
-			_, err := New(t.Context(), cfg)
+			_, err := New(t.Context(), cfg, NoopTelemetry())
 			require.Error(t, err)
 		})
 	}

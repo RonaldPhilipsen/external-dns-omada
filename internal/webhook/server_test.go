@@ -269,6 +269,7 @@ func TestExposedEndpoints(t *testing.T) {
 	resp.Body.Close()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 	assert.Contains(t, string(metricsBody), "go_goroutines")
+	assert.NotContains(t, string(metricsBody), "external_dns_build_info")
 }
 
 func TestUnknownPathFallsBackToNegotiate(t *testing.T) {

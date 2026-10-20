@@ -10,6 +10,9 @@ import (
 	"time"
 
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
 
 	"github.com/RonaldPhilipsen/external-dns-omada/internal/sets"
 	"sigs.k8s.io/external-dns/endpoint"
@@ -22,6 +25,10 @@ const (
 	entryEnableProperty   = "Omada/entry.enable"
 	entryNetworksProperty = "Omada/entry.network.ids"
 	maxIPTargets          = 32
+
+	// The attribute keys recorded on the omada.dns.* instruments.
+	dnsOperationAttribute = "omada.dns.operation"
+	dnsErrorAttribute     = "omada.dns.error"
 )
 
 // Config carries everything the provider needs to manage an Omada site.
@@ -72,13 +79,18 @@ type Provider struct {
 	lanNetworkIDs sets.Set[string]
 	// writeInterval spaces out write requests so a batch of changes does
 	// not trip the controller's write rate limit.
-	writeInterval time.Duration
+	writeInterval  time.Duration
+	tel            Telemetry
+	entriesGauge   metric.Int64Gauge
+	changesCounter metric.Int64Counter
+	errorsCounter  metric.Int64Counter
 }
 
-// New creates a Provider from the given configuration. It authenticates
-// against the controller and resolves the site and LAN networks, so a
-// misconfiguration fails at startup instead of on the first reconcile.
-func New(ctx context.Context, cfg Config) (*Provider, error) {
+// New creates a Provider from the given configuration and telemetry wiring.
+// It authenticates against the controller and resolves the site and LAN
+// networks, so a misconfiguration fails at startup instead of on the first
+// reconcile.
+func New(ctx context.Context, cfg Config, tel Telemetry) (*Provider, error) {
 	server, err := validateConfig(cfg)
 	if err != nil {
 		return nil, err
@@ -91,14 +103,43 @@ func New(ctx context.Context, cfg Config) (*Provider, error) {
 	for _, id := range c.lanNetworkIDs {
 		networks.Insert(id)
 	}
-	return &Provider{
+	p := &Provider{
 		api:           c,
 		domainFilter:  endpoint.NewDomainFilter(cfg.DomainFilter),
 		dryRun:        cfg.DryRun,
 		siteName:      cfg.SiteName,
 		lanNetworkIDs: networks,
+		tel:           tel,
 		writeInterval: 500 * time.Millisecond,
-	}, nil
+	}
+	if err := p.initInstruments(); err != nil {
+		return nil, fmt.Errorf("initializing omada telemetry instruments: %w", err)
+	}
+	return p, nil
+}
+
+// initInstruments creates the three omada.dns.* instruments on the
+// provider's meter. It must run before Records or ApplyChanges is called.
+func (p *Provider) initInstruments() error {
+	var err error
+	if p.entriesGauge, err = p.tel.Meter.Int64Gauge("omada.dns.entries",
+		// The gauge counts the entries Records reports, i.e. the entries
+		// this instance manages after applying its domain filter.
+		metric.WithDescription("Number of Omada LAN DNS entries managed by this instance"),
+		metric.WithUnit("{entry}")); err != nil {
+		return err
+	}
+	if p.changesCounter, err = p.tel.Meter.Int64Counter("omada.dns.changes",
+		metric.WithDescription("DNS changes handled by the provider, by operation outcome"),
+		metric.WithUnit("{change}")); err != nil {
+		return err
+	}
+	if p.errorsCounter, err = p.tel.Meter.Int64Counter("omada.dns.errors",
+		metric.WithDescription("Errors while syncing DNS records with the Omada site, by category"),
+		metric.WithUnit("{error}")); err != nil {
+		return err
+	}
+	return nil
 }
 
 func validateConfig(cfg Config) (string, error) {
@@ -141,6 +182,7 @@ func (p *Provider) GetDomainFilter() endpoint.DomainFilterInterface {
 func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 	entries, err := p.api.listLanDNS(ctx)
 	if err != nil {
+		p.errorsCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(dnsErrorAttribute, "list")))
 		return nil, provider.NewSoftErrorf("omada: listing LAN DNS entries: %v", err)
 	}
 	var endpoints []*endpoint.Endpoint
@@ -173,6 +215,7 @@ func (p *Provider) Records(ctx context.Context) ([]*endpoint.Endpoint, error) {
 			log.Warnf("omada: LAN DNS entry %q (%s) is a forwarder, not managed by external-dns", e.Name, e.Domain)
 		}
 	}
+	p.entriesGauge.Record(ctx, int64(len(endpoints)))
 	return endpoints, nil
 }
 
@@ -324,6 +367,14 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 	if changes == nil {
 		return nil
 	}
+	ctx, span := p.tel.Tracer.Start(ctx, "omada.ApplyChanges")
+	defer span.End()
+	span.SetAttributes(
+		attribute.Int("omada.dns.planned.create", len(changes.Create)),
+		attribute.Int("omada.dns.planned.update", len(changes.UpdateNew)),
+		attribute.Int("omada.dns.planned.delete", len(changes.Delete)),
+		attribute.Bool("omada.dns.dry_run", p.dryRun),
+	)
 	current, err := p.currentState(ctx)
 	if err != nil {
 		return err
@@ -331,6 +382,7 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 	var errs []error
 	for fqdn, d := range desiredFromChanges(changes) {
 		if vErrs := validateDesired(fqdn, d); len(vErrs) > 0 {
+			p.errorsCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(dnsErrorAttribute, "validate")))
 			errs = append(errs, vErrs...)
 			continue
 		}
@@ -338,23 +390,40 @@ func (p *Provider) ApplyChanges(ctx context.Context, changes *plan.Changes) erro
 			errs = append(errs, err)
 		}
 	}
-	return errors.Join(errs...)
+	err = errors.Join(errs...)
+	// The SDK leaves an unmarked span in the Unset state, so the outcome is
+	// set explicitly in both directions.
+	if err != nil {
+		span.SetStatus(codes.Error, err.Error())
+	} else {
+		span.SetStatus(codes.Ok, "")
+	}
+	return err
 }
 
 func (p *Provider) applyDesired(ctx context.Context, fqdn string, d *desiredState, cur *lanDNSState) error {
 	empty := len(d.ipv4s) == 0 && len(d.ipv6s) == 0 && len(d.cnames) == 0
+	recordChange := func(operation string) {
+		p.changesCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(dnsOperationAttribute, operation)))
+	}
+	recordError := func(category string) {
+		p.errorsCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(dnsErrorAttribute, category)))
+	}
 
 	if cur == nil {
 		if empty {
+			recordChange("skipped")
 			return nil
 		}
 		entry := buildEntry(fqdn, d, true)
 		if p.dryRun {
 			log.Infof("DRY-RUN: would create Omada LAN DNS entry %q for %s", entry.Name, fqdn)
+			recordChange("dry_run")
 			return nil
 		}
 		id, err := p.api.createLanDNS(ctx, entry)
 		if err != nil {
+			recordError("create")
 			return provider.NewSoftErrorf("omada: creating entry for %q: %v", fqdn, err)
 		}
 		if id == "" {
@@ -362,6 +431,7 @@ func (p *Provider) applyDesired(ctx context.Context, fqdn string, d *desiredStat
 		} else {
 			log.Infof("Created Omada LAN DNS entry %q for %s (id %s)", entry.Name, fqdn, id)
 		}
+		recordChange("created")
 		p.spaceWrites()
 		return nil
 	}
@@ -369,36 +439,45 @@ func (p *Provider) applyDesired(ctx context.Context, fqdn string, d *desiredStat
 	if empty {
 		if cur.entryID == "" {
 			log.Warnf("omada: cannot delete entry for %q: no entry id known", fqdn)
+			recordChange("skipped")
 			return nil
 		}
 		if p.dryRun {
 			log.Infof("DRY-RUN: would delete Omada LAN DNS entry %q for %s", cur.entryID, fqdn)
+			recordChange("dry_run")
 			return nil
 		}
 		if err := p.api.deleteLanDNS(ctx, cur.entryID); err != nil {
+			recordError("delete")
 			return provider.NewSoftErrorf("omada: deleting entry for %q: %v", fqdn, err)
 		}
 		log.Infof("Deleted Omada LAN DNS entry %q for %s", cur.entryID, fqdn)
+		recordChange("deleted")
 		p.spaceWrites()
 		return nil
 	}
 
 	if p.sameState(cur, d) {
+		recordChange("skipped")
 		return nil
 	}
 	if cur.entryID == "" {
+		recordError("update")
 		return provider.NewSoftErrorf("omada: cannot update entry for %q: no entry id known", fqdn)
 	}
 	entry := buildEntry(fqdn, d, cur.enable)
 	entry.ID = cur.entryID
 	if p.dryRun {
 		log.Infof("DRY-RUN: would update Omada LAN DNS entry %q for %s", cur.entryID, fqdn)
+		recordChange("dry_run")
 		return nil
 	}
 	if err := p.api.updateLanDNS(ctx, cur.entryID, entry); err != nil {
+		recordError("update")
 		return provider.NewSoftErrorf("omada: updating entry for %q: %v", fqdn, err)
 	}
 	log.Infof("Updated Omada LAN DNS entry %q for %s", cur.entryID, fqdn)
+	recordChange("updated")
 	p.spaceWrites()
 	return nil
 }

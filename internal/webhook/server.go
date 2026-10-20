@@ -10,8 +10,10 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	log "github.com/sirupsen/logrus"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 
 	"sigs.k8s.io/external-dns/endpoint"
 	"sigs.k8s.io/external-dns/plan"
@@ -31,17 +33,48 @@ const (
 	DefaultMaxBodySize = 32 << 20
 )
 
+type options struct {
+	metricsHandler http.Handler
+}
+
+// Option configures a Server.
+type Option func(*options)
+
+// WithMetricsRegistry serves the given registry at /metrics (the
+// OTel-bridged registry from internal/telemetry).
+func WithMetricsRegistry(reg *prometheus.Registry) Option {
+	return func(o *options) {
+		o.metricsHandler = promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
+	}
+}
+
 // Server serves a provider over the ExternalDNS webhook HTTP API.
 type Server struct {
-	provider    provider.Provider
-	maxBodySize int64
+	provider       provider.Provider
+	maxBodySize    int64
+	metricsHandler http.Handler
 }
 
 // NewServer returns a Server serving the given provider. A non-positive
 // maxBodySize disables request body capping, mirroring
-// --webhook-provider-max-body-size=0 on the external-dns side.
-func NewServer(p provider.Provider, maxBodySize int64) *Server {
-	return &Server{provider: p, maxBodySize: maxBodySize}
+// --webhook-provider-max-body-size=0 on the external-dns side. Without
+// WithMetricsRegistry, /metrics serves the Go runtime and process
+// collectors.
+func NewServer(p provider.Provider, maxBodySize int64, opts ...Option) *Server {
+	o := options{metricsHandler: defaultMetricsHandler()}
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return &Server{provider: p, maxBodySize: maxBodySize, metricsHandler: o.metricsHandler}
+}
+
+// defaultMetricsHandler mirrors today's /metrics: the classic Go and
+// process runtime collectors on an explicit registry.
+func defaultMetricsHandler() http.Handler {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(prometheus.NewGoCollector())
+	reg.MustRegister(prometheus.NewProcessCollector(prometheus.ProcessCollectorOpts{}))
+	return promhttp.HandlerFor(reg, promhttp.HandlerOpts{})
 }
 
 // ProviderHandler serves the endpoints external-dns calls on the provider:
@@ -54,7 +87,7 @@ func (s *Server) ProviderHandler() http.Handler {
 	m.HandleFunc("/", s.negotiateHandler)
 	m.HandleFunc("/records", s.recordsHandler)
 	m.HandleFunc("/adjustendpoints", s.adjustEndpointsHandler)
-	return m
+	return otelhttp.NewHandler(m, "provider")
 }
 
 // ExposedHandler serves the endpoints the provider exposes to the cluster:
@@ -70,8 +103,8 @@ func (s *Server) ExposedHandler() http.Handler {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
-	m.HandleFunc("/metrics", promhttp.Handler().ServeHTTP)
-	return m
+	m.HandleFunc("/metrics", s.metricsHandler.ServeHTTP)
+	return otelhttp.NewHandler(m, "exposed")
 }
 
 func (s *Server) negotiateHandler(w http.ResponseWriter, _ *http.Request) {

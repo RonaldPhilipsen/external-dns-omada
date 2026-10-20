@@ -20,6 +20,7 @@ import (
 
 	"github.com/RonaldPhilipsen/external-dns-omada/internal/config"
 	"github.com/RonaldPhilipsen/external-dns-omada/internal/omada"
+	"github.com/RonaldPhilipsen/external-dns-omada/internal/telemetry"
 	"github.com/RonaldPhilipsen/external-dns-omada/internal/webhook"
 )
 
@@ -51,13 +52,22 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	provider, err := omada.New(ctx, cfg.Omada)
+	tel, err := telemetry.Init(ctx, BuildVersion)
+	if err != nil {
+		return fmt.Errorf("initializing telemetry: %w", err)
+	}
+
+	provider, err := omada.New(ctx, cfg.Omada, omada.Telemetry{
+		Tracer: tel.Tracer("omada"),
+		Meter:  tel.Meter("omada"),
+	})
 	if err != nil {
 		return fmt.Errorf("initializing omada provider: %w", err)
 	}
 	log.Infof("connected to Omada controller for site %q; managed LAN networks: %v", cfg.Omada.SiteName, provider.LanNetworkIDs())
 
-	web := webhook.NewServer(provider, cfg.MaxBodySize)
+	web := webhook.NewServer(provider, cfg.MaxBodySize,
+		webhook.WithMetricsRegistry(tel.Registry()))
 
 	providerSrv := &http.Server{
 		Addr:              cfg.WebhookListen,
@@ -111,7 +121,22 @@ func run() error {
 	if err := exposedSrv.Shutdown(shutdownCtx); err != nil {
 		errs = append(errs, fmt.Errorf("shutting down exposed endpoints: %w", err))
 	}
-	return errors.Join(errs...)
+	var flushErr error
+	if err := tel.Shutdown(shutdownCtx); err != nil {
+		log.Errorf("flushing telemetry: %v", err)
+		flushErr = err
+	}
+	return joinShutdown(errs, flushErr)
+}
+
+// joinShutdown keeps an otherwise clean shutdown clean: a telemetry flush
+// failure is only joined into the returned error when an HTTP server
+// shutdown already failed.
+func joinShutdown(shutdownErrs []error, flushErr error) error {
+	if flushErr != nil && len(shutdownErrs) > 0 {
+		shutdownErrs = append(shutdownErrs, flushErr)
+	}
+	return errors.Join(shutdownErrs...)
 }
 
 func setupLogging(cfg *config.Config) {
