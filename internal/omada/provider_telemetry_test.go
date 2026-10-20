@@ -155,12 +155,23 @@ func TestApplyChangesMixedSuccessAndFailure(t *testing.T) {
 	err := p.ApplyChanges(t.Context(), changes)
 	require.Error(t, err)
 
-	require.Len(t, sr.Ended(), 1)
-	assert.Equal(t, codes.Error, sr.Ended()[0].Status().Code)
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
 	assert.Equal(t, map[string]int64{"omada.dns.operation=created": 1},
 		metricValue(t, reader, "omada.dns.changes"))
 	assert.Equal(t, map[string]int64{"omada.dns.error=delete": 1},
 		metricValue(t, reader, "omada.dns.errors"))
+}
+
+func TestApplyChangesListFailureMarksSpanError(t *testing.T) {
+	fake := &fakeAPI{listErr: errors.New("boom")}
+	p, sr, _ := newInstrumentedProvider(t, fake)
+	changes := &plan.Changes{Create: []*endpoint.Endpoint{epA("a.example.com.", "10.0.0.1")}}
+	require.Error(t, p.ApplyChanges(t.Context(), changes))
+	spans := sr.Ended()
+	require.Len(t, spans, 1)
+	assert.Equal(t, codes.Error, spans[0].Status().Code)
 }
 
 func TestApplyChangesValidateErrorCounter(t *testing.T) {

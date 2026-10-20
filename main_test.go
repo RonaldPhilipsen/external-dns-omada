@@ -22,6 +22,9 @@ func TestJoinShutdown(t *testing.T) {
 		assert.ErrorIs(t, err, errServe)
 		assert.ErrorIs(t, err, errFlush)
 	})
+	t.Run("clean shutdown with a non-nil empty error slice stays clean", func(t *testing.T) {
+		assert.NoError(t, joinShutdown([]error{}, errFlush))
+	})
 	t.Run("no errors", func(t *testing.T) {
 		assert.NoError(t, joinShutdown(nil, nil))
 	})

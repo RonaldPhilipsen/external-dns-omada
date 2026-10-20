@@ -135,8 +135,7 @@ func (t *Telemetry) Registry() *prometheus.Registry {
 }
 
 // Shutdown flushes and stops both providers, joining their errors. It is
-// idempotent: only the first call does anything, later calls return the same
-// error.
+// idempotent: only the first call does anything, later calls return nil.
 func (t *Telemetry) Shutdown(ctx context.Context) error {
 	var err error
 	t.shutdownOnce.Do(func() {
@@ -186,11 +185,12 @@ func newMetricExporter(ctx context.Context) (sdkmetric.Exporter, error) {
 
 // protocol resolves the OTLP protocol for one signal: the signal-specific
 // environment variable wins over the shared fallback, the default is grpc,
-// and only grpc and http/protobuf are supported.
+// and only grpc and http/protobuf are supported. An unsupported value names
+// the variable that supplied it.
 func protocol(envKey, fallbackKey string) (string, error) {
-	p := os.Getenv(envKey)
+	p, key := os.Getenv(envKey), envKey
 	if p == "" {
-		p = os.Getenv(fallbackKey)
+		p, key = os.Getenv(fallbackKey), fallbackKey
 	}
 	if p == "" {
 		p = protocolGRPC
@@ -199,7 +199,7 @@ func protocol(envKey, fallbackKey string) (string, error) {
 		return p, nil
 	}
 	return "", fmt.Errorf("unsupported OTLP protocol %q for %s (supported: %q, %q)",
-		p, envKey, protocolGRPC, protocolHTTP)
+		p, key, protocolGRPC, protocolHTTP)
 }
 
 // signalEnabled reports whether the signal behind envKey is exported. The
