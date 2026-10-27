@@ -598,6 +598,85 @@ func TestAuthRefresh(t *testing.T) {
 	}
 }
 
+// TestTokenExpiredEnvelope covers controllers that answer a stale access
+// token with an HTTP 200 and a -44112 envelope error instead of a 401;
+// the client must treat it as not authorized, refresh the token, and
+// retry the original request once.
+func TestTokenExpiredEnvelope(t *testing.T) {
+	const staleToken = "STALE"
+
+	var mu sync.Mutex
+	st := &authState{}
+
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == authPath:
+			handleAuthorize(w, r, &mu, st)
+		case strings.HasSuffix(r.URL.Path, "/sites"):
+			handleSites(w, r, &mu, st)
+		case strings.HasSuffix(r.URL.Path, "/lan-networks"):
+			handleLanNetworks(w, r, &mu, st)
+		default:
+			mu.Lock()
+			expired := r.Header.Get("Authorization") == "AccessToken="+staleToken
+			mu.Unlock()
+			if expired {
+				// The real controller answers expiry with 200 plus an
+				// error envelope, not a 401.
+				w.Header().Set("Content-Type", contentTypeJSON)
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"errorCode": -44112,
+					"msg":       "The access token has expired. Please re-initiate the refreshToken process to obtain the access token.",
+				})
+				return
+			}
+			handleLanDNSList(w, r, &mu, st)
+		}
+	})
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := newClient(
+		t.Context(),
+		base.String(),
+		"test-omada-id",
+		"test-client",
+		"test-secret",
+		testSite.name,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+
+	// Expire the token the way the controller does: stale tokens keep
+	// getting 200s, now with the -44112 envelope.
+	mu.Lock()
+	st.token = staleToken
+	mu.Unlock()
+
+	entries, err := cl.listLanDNS(t.Context())
+	if err != nil {
+		t.Fatalf("listLanDNS() error = %v, want success after token refresh", err)
+	}
+	if len(entries) != 1 || entries[0].ID != "dns-1" {
+		t.Fatalf("entries = %+v, want the single static entry", entries)
+	}
+	if cl.accessToken != "AT-2" {
+		t.Fatalf("accessToken = %q, want AT-2", cl.accessToken)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if st.refreshCalls != 1 {
+		t.Fatalf("refresh calls = %d, want 1", st.refreshCalls)
+	}
+	if st.authorizeCalls != 1 {
+		t.Fatalf("authorize calls = %d, want 1 (refresh suffices, no full re-authorize)", st.authorizeCalls)
+	}
+}
+
 func TestListLanDNSPagination(t *testing.T) {
 	const total = 1500
 

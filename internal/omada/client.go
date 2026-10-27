@@ -31,6 +31,11 @@ const (
 
 	pageKey     = "page"
 	pageSizeKey = "pageSize"
+
+	// errCodeTokenExpired is the envelope errorCode the controller returns
+	// with an HTTP 200 when the access token has expired. It must be
+	// treated like a 401 so do() refreshes the token and retries.
+	errCodeTokenExpired = -44112
 )
 
 // errNotAuthorized marks a 401 response from the Omada controller. The
@@ -418,7 +423,8 @@ func (c *omadaClient) newRequest(ctx context.Context, method, path string, query
 
 // send executes the request and decodes the envelope. A non-zero
 // errorCode is mapped to a plain error carrying the code and message; a
-// 401 is mapped to errNotAuthorized regardless of the body.
+// 401, or the token-expired envelope code, is mapped to
+// errNotAuthorized so do() refreshes the token and retries.
 func (c *omadaClient) send(req *http.Request, result *omadaEnvelope) error {
 	c.mu.Lock()
 	token := c.accessToken
@@ -443,6 +449,9 @@ func (c *omadaClient) send(req *http.Request, result *omadaEnvelope) error {
 	}
 	if err := json.Unmarshal(data, result); err != nil {
 		return fmt.Errorf("omada: decode response: %w", err)
+	}
+	if result.ErrorCode == errCodeTokenExpired {
+		return errNotAuthorized
 	}
 	if result.ErrorCode != 0 {
 		return fmt.Errorf("omada error %d: %s", result.ErrorCode, result.Msg)
