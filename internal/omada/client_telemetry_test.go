@@ -52,11 +52,11 @@ func TestClientHTTPIsInstrumented(t *testing.T) {
 	assert.True(t, sawSites, "the site resolution call must produce a client span")
 }
 
-// TestClientRefreshDoesNotLeakCredentials pins the spec non-goal that no
-// span attribute carries credentials: the 401 -> refresh -> retry path must
-// run, but the refresh request puts client_secret and refresh_token in the
-// URL query, so no span of it may appear.
-func TestClientRefreshDoesNotLeakCredentials(t *testing.T) {
+// TestClientReAuthDoesNotLeakCredentials pins the spec non-goal that no
+// span attribute carries credentials: the 401 -> re-auth -> retry path must
+// run, but the token request carries client_secret, so no span of it may
+// appear.
+func TestClientReAuthDoesNotLeakCredentials(t *testing.T) {
 	sr := tracetest.NewSpanRecorder()
 	tp := sdktrace.NewTracerProvider(sdktrace.WithSpanProcessor(sr))
 	prev := otel.GetTracerProvider()
@@ -78,7 +78,7 @@ func TestClientRefreshDoesNotLeakCredentials(t *testing.T) {
 			sitesCalls++
 			mu.Unlock()
 			if first {
-				// Expired token: force the 401 -> refresh -> retry path.
+				// Expired token: force the 401 -> re-auth -> retry path.
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
@@ -93,15 +93,14 @@ func TestClientRefreshDoesNotLeakCredentials(t *testing.T) {
 	require.NotEmpty(t, cl.lanNetworkIDs)
 
 	mu.Lock()
-	refreshCalls := st.refreshCalls
+	authorizeCalls := st.authorizeCalls
 	mu.Unlock()
-	require.Positive(t, refreshCalls, "the test must have exercised the refresh path")
+	require.GreaterOrEqual(t, authorizeCalls, 2, "the test must have exercised the re-auth path")
 
 	for _, s := range sr.Ended() {
 		for _, kv := range s.Attributes() {
 			v := kv.Value.AsString()
 			assert.NotContains(t, v, clientSecret, "span %q must not carry the client secret", s.Name())
-			assert.NotContains(t, v, "RT-test", "span %q must not carry the refresh token", s.Name())
 			assert.NotContains(t, v, "AT-test", "span %q must not carry the access token", s.Name())
 		}
 		if s.SpanKind() == trace.SpanKindClient {

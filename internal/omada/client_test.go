@@ -13,6 +13,9 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/RonaldPhilipsen/omada/cloud"
+	"github.com/stretchr/testify/require"
 )
 
 func newTestServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
@@ -32,19 +35,17 @@ func (errorTransport) RoundTrip(*http.Request) (*http.Response, error) {
 // by mu so handler goroutines never race.
 type authState struct {
 	token          string
-	refreshToken   string
 	authorizeCalls int
-	refreshCalls   int
 	// lastAuth records the Authorization header of the last non-auth request.
 	lastAuth string
-	// lastRefreshQuery records the query of the last refresh_token request.
-	lastRefreshQuery url.Values
 	// networksEmpty makes handleLanNetworks return an empty list.
 	networksEmpty bool
 }
 
 // handleAuthorize implements POST /openapi/authorize/token for the test
-// server. A client secret of "bad-secret" is rejected with HTTP 401.
+// server. A client secret of "bad-secret" is rejected with HTTP 401. Only
+// the client_credentials grant is served: the upstream client re-runs that
+// grant on every re-authentication and never uses a refresh token.
 func handleAuthorize(w http.ResponseWriter, r *http.Request, mu *sync.Mutex, st *authState) {
 	w.Header().Set("Content-Type", contentTypeJSON)
 	if r.Method != http.MethodPost {
@@ -77,7 +78,6 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request, mu *sync.Mutex, st 
 			return
 		}
 		st.token = "AT-test"
-		st.refreshToken = "RT-test"
 		if err := json.NewEncoder(w).Encode(map[string]any{
 			"errorCode": 0,
 			"msg":       "success",
@@ -86,30 +86,6 @@ func handleAuthorize(w http.ResponseWriter, r *http.Request, mu *sync.Mutex, st 
 				"tokenType":    "bearer",
 				"expiresIn":    7200,
 				"refreshToken": "RT-test",
-			},
-		}); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-		}
-		return
-	}
-
-	if grantType == "refresh_token" {
-		st.refreshCalls++
-		st.lastRefreshQuery = r.URL.Query()
-		if r.URL.Query().Get("refresh_token") != st.refreshToken {
-			http.Error(w, "invalid refresh token", http.StatusUnauthorized)
-			return
-		}
-		st.token = "AT-2"
-		st.refreshToken = "RT-2"
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"errorCode": 0,
-			"msg":       "success",
-			"result": map[string]any{
-				"accessToken":  "AT-2",
-				"tokenType":    "bearer",
-				"expiresIn":    7200,
-				"refreshToken": "RT-2",
 			},
 		}); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -235,7 +211,6 @@ func TestNewClient(t *testing.T) {
 		networkNames  string
 		networksEmpty bool
 		wantErr       string
-		wantToken     string
 		wantSiteID    string
 		wantNetworks  []string
 	}{
@@ -243,7 +218,6 @@ func TestNewClient(t *testing.T) {
 			name:         "valid credentials and site",
 			clientSecret: "test-secret",
 			siteName:     testSite.name,
-			wantToken:    "AT-test",
 			wantSiteID:   testSite.id,
 			wantNetworks: []string{"net-1", "net-2"},
 		},
@@ -271,7 +245,6 @@ func TestNewClient(t *testing.T) {
 			clientSecret: "test-secret",
 			siteName:     testSite.name,
 			networkNames: "guest, default",
-			wantToken:    "AT-test",
 			wantSiteID:   testSite.id,
 			wantNetworks: []string{"net-1", "net-2"},
 		},
@@ -334,9 +307,6 @@ func TestNewClient(t *testing.T) {
 			if err != nil {
 				t.Fatalf("newClient() error = %v", err)
 			}
-			if cl.accessToken != tt.wantToken {
-				t.Fatalf("accessToken = %q, want %q", cl.accessToken, tt.wantToken)
-			}
 			if cl.siteID != tt.wantSiteID {
 				t.Fatalf("siteID = %q, want %q", cl.siteID, tt.wantSiteID)
 			}
@@ -359,177 +329,76 @@ func TestNewClient(t *testing.T) {
 }
 
 func TestErrorCodeMapping(t *testing.T) {
-	t.Run("envelope error carries code and message", func(t *testing.T) {
-		var mu sync.Mutex
-		st := &authState{}
+	var mu sync.Mutex
+	st := &authState{}
 
-		server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == authPath {
-				handleAuthorize(w, r, &mu, st)
-				return
-			}
-			if strings.HasSuffix(r.URL.Path, "/sites") {
-				handleSites(w, r, &mu, st)
-				return
-			}
-			if strings.HasSuffix(r.URL.Path, "/lan-networks") {
-				handleLanNetworks(w, r, &mu, st)
-				return
-			}
-			w.Header().Set("Content-Type", contentTypeJSON)
-			if r.Method == http.MethodPost {
-				_ = json.NewEncoder(w).Encode(map[string]any{
-					"errorCode": -35311,
-					"msg":       "domain already exists",
-					"result":    nil,
-				})
-				return
-			}
+	server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == authPath {
+			handleAuthorize(w, r, &mu, st)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/sites") {
+			handleSites(w, r, &mu, st)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/lan-networks") {
+			handleLanNetworks(w, r, &mu, st)
+			return
+		}
+		w.Header().Set("Content-Type", contentTypeJSON)
+		if r.Method == http.MethodPost {
 			_ = json.NewEncoder(w).Encode(map[string]any{
-				"errorCode": 0,
-				"msg":       "success",
-				"result":    map[string]any{"id": "dns-1"},
+				"errorCode": -35311,
+				"msg":       "domain already exists",
+				"result":    nil,
 			})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"errorCode": 0,
+			"msg":       "success",
+			"result":    map[string]any{"id": "dns-1"},
 		})
-		base, err := url.Parse(server.URL)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cl, err := newClient(
-			t.Context(),
-			base.String(),
-			"test-omada-id",
-			"test-client",
-			"test-secret",
-			testSite.name,
-			"",
-			false,
-		)
-		if err != nil {
-			t.Fatalf("newClient() error = %v", err)
-		}
-		_, err = cl.createLanDNS(t.Context(), lanDNS{
-			Domain:        "test.lan",
-			Type:          0,
-			Enable:        true,
-			IPAddresses:   []string{"192.168.1.10"},
-			IPv6Addresses: []string{"fd00::10"},
-		})
-		if err == nil {
-			t.Fatal("createLanDNS() error = nil, want envelope error")
-		}
-		if !strings.Contains(err.Error(), "domain already exists") {
-			t.Fatalf("error = %q, want it to contain the envelope msg", err)
-		}
-		if !strings.Contains(err.Error(), "-35311") {
-			t.Fatalf("error = %q, want it to contain the error code", err.Error())
-		}
-		if errors.Is(err, errNotAuthorized) {
-			t.Fatal("envelope error must not be classified as not authorized")
-		}
 	})
-
-	t.Run("auth failure surfaces errNotAuthorized", func(t *testing.T) {
-		var mu sync.Mutex
-		st := &authState{}
-		// After startup, the token is invalidated and both refresh and
-		// re-authorize fail, so the retry loop must give up with the
-		// original 401.
-		var authCalls int
-
-		server := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path == authPath {
-				grantType := r.URL.Query().Get("grant_type")
-				if grantType == "client_credentials" {
-					mu.Lock()
-					authCalls++
-					first := authCalls == 1
-					if first {
-						st.token = "AT-first"
-						st.refreshToken = "RT-first"
-					}
-					mu.Unlock()
-					if !first {
-						http.Error(w, "invalid client credentials", http.StatusUnauthorized)
-						return
-					}
-					w.Header().Set("Content-Type", contentTypeJSON)
-					_ = json.NewEncoder(w).Encode(map[string]any{
-						"errorCode": 0,
-						"msg":       "success",
-						"result": map[string]any{
-							"accessToken":  "AT-first",
-							"tokenType":    "bearer",
-							"expiresIn":    7200,
-							"refreshToken": "RT-first",
-						},
-					})
-					return
-				}
-				http.Error(w, "invalid refresh token", http.StatusUnauthorized)
-				return
-			}
-			if strings.HasSuffix(r.URL.Path, "/sites") {
-				handleSites(w, r, &mu, st)
-				return
-			}
-			if strings.HasSuffix(r.URL.Path, "/lan-networks") {
-				handleLanNetworks(w, r, &mu, st)
-				return
-			}
-			mu.Lock()
-			authorized := r.Header.Get("Authorization") == "AccessToken="+st.token
-			mu.Unlock()
-			w.Header().Set("Content-Type", contentTypeJSON)
-			if !authorized {
-				http.Error(w, "unauthorized", http.StatusUnauthorized)
-				return
-			}
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"errorCode": 0,
-				"msg":       "success",
-				"result": map[string]any{
-					"totalRows":   0,
-					"currentPage": 1,
-					"currentSize": 0,
-					"data":        []any{},
-				},
-			})
-		})
-		base, err := url.Parse(server.URL)
-		if err != nil {
-			t.Fatal(err)
-		}
-		cl, err := newClient(
-			t.Context(),
-			base.String(),
-			"test-omada-id",
-			"test-client",
-			"test-secret",
-			testSite.name,
-			"",
-			false,
-		)
-		if err != nil {
-			t.Fatalf("newClient() error = %v", err)
-		}
-		// Invalidate the token: subsequent requests are 401, refresh and
-		// re-authorize both fail.
-		mu.Lock()
-		st.token = "AT-stale"
-		mu.Unlock()
-
-		_, err = cl.listLanDNS(t.Context())
-		if err == nil {
-			t.Fatal("listLanDNS() error = nil, want not authorized")
-		}
-		if !errors.Is(err, errNotAuthorized) {
-			t.Fatalf("error = %q, want it to wrap errNotAuthorized", err)
-		}
+	base, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cl, err := newClient(
+		t.Context(),
+		base.String(),
+		"test-omada-id",
+		"test-client",
+		"test-secret",
+		testSite.name,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("newClient() error = %v", err)
+	}
+	_, err = cl.createLanDNS(t.Context(), lanDNS{
+		Domain:        "test.lan",
+		Type:          0,
+		Enable:        true,
+		IPAddresses:   []string{"192.168.1.10"},
+		IPv6Addresses: []string{"fd00::10"},
 	})
+	if err == nil {
+		t.Fatal("createLanDNS() error = nil, want envelope error")
+	}
+	if !strings.Contains(err.Error(), "domain already exists") {
+		t.Fatalf("error = %q, want it to contain the envelope msg", err.Error())
+	}
+	if !strings.Contains(err.Error(), "-35311") {
+		t.Fatalf("error = %q, want it to contain the error code", err.Error())
+	}
 }
 
-func TestAuthRefresh(t *testing.T) {
+// Test401TriggersReAuthAndRetry covers controllers that answer a stale
+// access token with HTTP 401; the upstream client must re-authorize and
+// retry the original request transparently.
+func Test401TriggersReAuthAndRetry(t *testing.T) {
 	var mu sync.Mutex
 	st := &authState{}
 
@@ -567,8 +436,8 @@ func TestAuthRefresh(t *testing.T) {
 		t.Fatalf("first listLanDNS() error = %v", err)
 	}
 
-	// Expire the token server-side: the next call must 401, refresh, and
-	// retry transparently.
+	// Expire the token server-side: the next call must 401, re-authorize,
+	// and retry transparently.
 	mu.Lock()
 	st.token = "AT-stale"
 	mu.Unlock()
@@ -580,28 +449,17 @@ func TestAuthRefresh(t *testing.T) {
 	if len(entries) != 1 || entries[0].ID != "dns-1" {
 		t.Fatalf("entries = %+v, want the single static entry", entries)
 	}
-	if cl.accessToken != "AT-2" {
-		t.Fatalf("accessToken = %q, want AT-2", cl.accessToken)
-	}
 	mu.Lock()
-	refreshCalls := st.refreshCalls
-	refreshQuery := st.lastRefreshQuery
-	mu.Unlock()
-	if refreshCalls != 1 {
-		t.Fatalf("refresh calls = %d, want 1", refreshCalls)
-	}
-	if refreshQuery.Get("grant_type") != "refresh_token" {
-		t.Fatalf("refresh grant_type = %q, want refresh_token", refreshQuery.Get("grant_type"))
-	}
-	if refreshQuery.Get("refresh_token") != "RT-test" {
-		t.Fatalf("refresh_token = %q, want RT-test", refreshQuery.Get("refresh_token"))
+	defer mu.Unlock()
+	if st.authorizeCalls != 2 {
+		t.Fatalf("authorize calls = %d, want 2 (startup plus re-auth after 401)", st.authorizeCalls)
 	}
 }
 
 // TestTokenExpiredEnvelope covers controllers that answer a stale access
-// token with an HTTP 200 and a -44112 envelope error instead of a 401;
-// the client must treat it as not authorized, refresh the token, and
-// retry the original request once.
+// token with an HTTP 200 and a -44112 envelope error instead of a 401; the
+// upstream client must treat it as token expiry, re-authorize, and retry
+// the original request once.
 func TestTokenExpiredEnvelope(t *testing.T) {
 	const staleToken = "STALE"
 
@@ -659,21 +517,15 @@ func TestTokenExpiredEnvelope(t *testing.T) {
 
 	entries, err := cl.listLanDNS(t.Context())
 	if err != nil {
-		t.Fatalf("listLanDNS() error = %v, want success after token refresh", err)
+		t.Fatalf("listLanDNS() error = %v, want success after re-auth", err)
 	}
 	if len(entries) != 1 || entries[0].ID != "dns-1" {
 		t.Fatalf("entries = %+v, want the single static entry", entries)
 	}
-	if cl.accessToken != "AT-2" {
-		t.Fatalf("accessToken = %q, want AT-2", cl.accessToken)
-	}
 	mu.Lock()
 	defer mu.Unlock()
-	if st.refreshCalls != 1 {
-		t.Fatalf("refresh calls = %d, want 1", st.refreshCalls)
-	}
-	if st.authorizeCalls != 1 {
-		t.Fatalf("authorize calls = %d, want 1 (refresh suffices, no full re-authorize)", st.authorizeCalls)
+	if st.authorizeCalls != 2 {
+		t.Fatalf("authorize calls = %d, want 2 (startup plus re-auth after expiry)", st.authorizeCalls)
 	}
 }
 
@@ -1072,18 +924,19 @@ func TestDeleteLanDNS(t *testing.T) {
 }
 
 func TestNetworkError(t *testing.T) {
-	cl := &omadaClient{
-		baseURL:    "https://controller.example.test",
-		omadaID:    "test-omada-id",
-		siteID:     "site-abc",
-		httpClient: &http.Client{Transport: errorTransport{}},
-	}
-	_, err := cl.listLanDNS(t.Context())
+	c, err := cloud.New(cloud.Options{
+		BaseURL:      "https://controller.example.test",
+		OmadacID:     "test-omada-id",
+		ClientID:     "test-client",
+		ClientSecret: "test-secret",
+		HTTPClient:   &http.Client{Transport: errorTransport{}},
+	})
+	require.NoError(t, err)
+	cl := &omadaClient{cl: c, omadaID: "test-omada-id", siteID: "site-abc"}
+
+	_, err = cl.listLanDNS(t.Context())
 	if err == nil {
 		t.Fatal("listLanDNS() error = nil, want transport error")
-	}
-	if errors.Is(err, errNotAuthorized) {
-		t.Fatal("transport error must not be classified as not authorized")
 	}
 }
 
