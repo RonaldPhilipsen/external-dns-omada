@@ -1,19 +1,18 @@
 package omada
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
-	"sync"
 
+	"github.com/RonaldPhilipsen/omada/cloud"
+	omadalanc "github.com/RonaldPhilipsen/omada/cloud/lan"
+	omadasite "github.com/RonaldPhilipsen/omada/cloud/site"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
@@ -24,62 +23,24 @@ const (
 	// accepts; larger values are silently capped by the controller.
 	lanDNSPageSize = 1000
 
+	// authPath is the controller's token endpoint, excluded from spans.
 	authPath = "/openapi/authorize/token"
-
-	clientIDKey     = "client_id"
-	clientSecretKey = "client_secret"
-
-	pageKey     = "page"
-	pageSizeKey = "pageSize"
-
-	// errCodeTokenExpired is the envelope errorCode the controller returns
-	// with an HTTP 200 when the access token has expired. It must be
-	// treated like a 401 so do() refreshes the token and retries.
-	errCodeTokenExpired = -44112
 )
 
-// errNotAuthorized marks a 401 response from the Omada controller. The
-// retry loop in do treats it as "token expired": refresh, re-authorize,
-// and try the original request once more.
-var errNotAuthorized = errors.New("omada: not authorized")
-
-// omadaClient is a minimal client for the Omada controller OpenAPI. Token
-// state is guarded by mu because the reconcile loop may call the client
-// concurrently with a refresh triggered by a 401.
+// omadaClient is a thin adapter over the github.com/RonaldPhilipsen/omada
+// northbound client. It resolves the configured site and LAN networks at
+// construction and exposes the LAN DNS operations the provider needs;
+// authentication, token refresh and 401/-44112 retries are handled by the
+// upstream client.
 type omadaClient struct {
-	mu           sync.Mutex
-	baseURL      string
-	omadaID      string
-	siteID       string
-	clientID     string
-	clientSecret string
-	httpClient   *http.Client
-	accessToken  string
-	refreshToken string
+	cl *cloud.Client
+	// omadaID is the Omada ID of the controller (OM-XXXXXXXX).
+	omadaID string
+	// siteID is the resolved ID of the configured site.
+	siteID string
 	// lanNetworkIDs are the site's LAN networks, attached to every created
 	// or updated entry.
 	lanNetworkIDs []string
-}
-
-type tokenResult struct {
-	AccessToken  string `json:"accessToken"`
-	RefreshToken string `json:"refreshToken"`
-}
-
-// omadaEnvelope is the common response wrapper of every OpenAPI endpoint.
-type omadaEnvelope struct {
-	ErrorCode int             `json:"errorCode"`
-	Msg       string          `json:"msg"`
-	Result    json.RawMessage `json:"result"`
-}
-
-type siteInfo struct {
-	SiteID string `json:"siteId"`
-	Name   string `json:"name"`
-}
-
-type sitesPage struct {
-	Data []siteInfo `json:"data"`
 }
 
 // lanDNS mirrors the LAN DNS VO of the Omada controller. Type 0 is an IP
@@ -97,26 +58,11 @@ type lanDNS struct {
 	LanNetworkIDs []string `json:"lanNetworkIds,omitempty"`
 }
 
-type lanDNSPage struct {
-	TotalRows   int      `json:"totalRows"`
-	CurrentPage int      `json:"currentPage"`
-	CurrentSize int      `json:"currentSize"`
-	Data        []lanDNS `json:"data"`
-}
-
-type createLanDNSResult struct {
-	ID string `json:"id"`
-}
-
 // lanNetwork is one entry of the site LAN network list at
 // /openapi/v1/{omadacId}/sites/{siteId}/lan-networks.
 type lanNetwork struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
-}
-
-type lanNetworksResult struct {
-	Data []lanNetwork `json:"data"`
 }
 
 // newClient authenticates against the Omada controller, resolves the
@@ -129,113 +75,86 @@ func newClient(ctx context.Context, server, omadaID, clientID, clientSecret, sit
 	}
 	// otelhttp wraps the base transport so every API call produces a
 	// client span; TLS behavior stays on the base transport. The auth
-	// endpoint is excluded: the controller requires client_secret and
-	// refresh_token as query parameters on token refresh, and span
+	// endpoint is excluded: its request carries client_secret, and span
 	// attributes must never carry credentials.
+	//
+	// InsecureTLS is set on the base transport here rather than via
+	// cloud.Options.InsecureTLS, because that option replaces a
+	// caller-provided transport and would drop the otelhttp wrapper.
 	baseTransport := &http.Transport{
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: tlsInsecureSkipVerify,
 		},
 	}
-	cl := &omadaClient{
-		baseURL:      base.String(),
-		omadaID:      omadaID,
-		clientID:     clientID,
-		clientSecret: clientSecret,
-		httpClient: &http.Client{
+	cl, err := cloud.New(cloud.Options{
+		BaseURL:      base.String(),
+		OmadacID:     omadaID,
+		ClientID:     clientID,
+		ClientSecret: clientSecret,
+		HTTPClient: &http.Client{
 			Transport: otelhttp.NewTransport(baseTransport, otelhttp.WithFilter(
 				func(r *http.Request) bool { return r.URL.Path != authPath })),
 		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("omada: create client: %w", err)
 	}
-	if err := cl.authorize(ctx); err != nil {
-		return nil, fmt.Errorf("omada: authorize: %w", err)
-	}
-	siteID, err := cl.resolveSite(ctx, siteName)
+	c := &omadaClient{cl: cl, omadaID: omadaID}
+	siteID, err := c.resolveSite(ctx, siteName)
 	if err != nil {
 		return nil, err
 	}
-	cl.siteID = siteID
-	if err := cl.resolveLanNetworks(ctx, networkNames); err != nil {
+	c.siteID = siteID
+	if err := c.resolveLanNetworks(ctx, networkNames); err != nil {
 		return nil, err
 	}
-	return cl, nil
+	return c, nil
 }
 
-func (c *omadaClient) authorize(ctx context.Context) error {
-	query := url.Values{"grant_type": {"client_credentials"}}
-	payload := map[string]string{
-		"omadacId":      c.omadaID,
-		clientIDKey:     c.clientID,
-		clientSecretKey: c.clientSecret,
-	}
-	req, err := c.newRequest(ctx, http.MethodPost, authPath, query, payload)
+// envelope is the common response wrapper of every OpenAPI endpoint.
+type envelope struct {
+	ErrorCode int32  `json:"errorCode"`
+	Msg       string `json:"msg"`
+}
+
+// decodeEnvelope reads the response body and maps a non-zero errorCode to a
+// *cloud.APIError carrying the controller's code and message. The raw body
+// is returned for callers that need the result payload.
+func decodeEnvelope(resp *http.Response) ([]byte, error) {
+	defer resp.Body.Close()
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return err
+		return nil, fmt.Errorf("omada: read response: %w", err)
 	}
-	var env omadaEnvelope
-	if err := c.send(req, &env); err != nil {
-		return err
+	var env envelope
+	if err := json.Unmarshal(data, &env); err != nil {
+		return nil, fmt.Errorf("omada: decode response: %w", err)
 	}
-	return c.storeTokenResult(env)
-}
-
-func (c *omadaClient) refresh(ctx context.Context) error {
-	c.mu.Lock()
-	rt := c.refreshToken
-	c.mu.Unlock()
-	if rt == "" {
-		return errNotAuthorized
+	if env.ErrorCode != 0 {
+		return nil, cloud.NewAPIError(int(env.ErrorCode), env.Msg)
 	}
-	query := url.Values{
-		"grant_type":    {"refresh_token"},
-		"refresh_token": {rt},
-		// The controller requires the client credentials both as query
-		// parameters and in the body on refresh.
-		clientIDKey:     {c.clientID},
-		clientSecretKey: {c.clientSecret},
-	}
-	payload := map[string]string{
-		clientIDKey:     c.clientID,
-		clientSecretKey: c.clientSecret,
-	}
-	req, err := c.newRequest(ctx, http.MethodPost, authPath, query, payload)
-	if err != nil {
-		return err
-	}
-	var env omadaEnvelope
-	if err := c.send(req, &env); err != nil {
-		return err
-	}
-	return c.storeTokenResult(env)
-}
-
-func (c *omadaClient) storeTokenResult(env omadaEnvelope) error {
-	var tr tokenResult
-	if err := json.Unmarshal(env.Result, &tr); err != nil {
-		return fmt.Errorf("omada: decode token response: %w", err)
-	}
-	c.mu.Lock()
-	c.accessToken = tr.AccessToken
-	c.refreshToken = tr.RefreshToken
-	c.mu.Unlock()
-	return nil
+	return data, nil
 }
 
 // resolveSite looks up the site ID for the configured site name.
 func (c *omadaClient) resolveSite(ctx context.Context, siteName string) (string, error) {
-	path := fmt.Sprintf("/openapi/v1/%s/sites", c.omadaID)
-	query := url.Values{pageKey: {"1"}, pageSizeKey: {"100"}}
-	var env omadaEnvelope
-	if err := c.do(ctx, http.MethodGet, path, query, nil, &env); err != nil {
+	resp, err := c.cl.Site().GetSiteList(ctx, c.omadaID, &omadasite.GetSiteListParams{Page: 1, PageSize: 100})
+	if err != nil {
+		return "", fmt.Errorf("omada: list sites: %w", err)
+	}
+	data, err := decodeEnvelope(resp)
+	if err != nil {
 		return "", err
 	}
-	var page sitesPage
-	if err := json.Unmarshal(env.Result, &page); err != nil {
+	var env omadasite.OperationResponseGridVOSiteSummaryInfo
+	if err := json.Unmarshal(data, &env); err != nil {
 		return "", fmt.Errorf("omada: decode sites response: %w", err)
 	}
-	for _, site := range page.Data {
-		if site.Name == siteName {
-			return site.SiteID, nil
+	if env.Result != nil && env.Result.Data != nil {
+		for _, s := range *env.Result.Data {
+			if s.SiteId != nil && s.Name != nil && *s.Name == siteName {
+				return *s.SiteId, nil
+			}
 		}
 	}
 	return "", fmt.Errorf("omada: site %q not found", siteName)
@@ -301,40 +220,61 @@ func selectLanNetworks(networks []lanNetwork, names string) ([]string, error) {
 
 // listLanNetworks returns the LAN networks of the configured site.
 func (c *omadaClient) listLanNetworks(ctx context.Context) ([]lanNetwork, error) {
-	path := fmt.Sprintf("/openapi/v1/%s/sites/%s/lan-networks", c.omadaID, c.siteID)
-	// The controller rejects list requests without pagination query
-	// parameters (-1001).
-	query := url.Values{pageKey: {"1"}, pageSizeKey: {"1000"}}
-	var env omadaEnvelope
-	if err := c.do(ctx, http.MethodGet, path, query, nil, &env); err != nil {
+	resp, err := c.cl.Lan().GetLanNetworkList(ctx, c.omadaID, c.siteID, &omadalanc.GetLanNetworkListParams{Page: 1, PageSize: 1000})
+	if err != nil {
+		return nil, fmt.Errorf("omada: list LAN networks: %w", err)
+	}
+	data, err := decodeEnvelope(resp)
+	if err != nil {
 		return nil, err
 	}
-	var result lanNetworksResult
-	if err := json.Unmarshal(env.Result, &result); err != nil {
+	var env omadalanc.OperationResponseLanNetworkOpenApiGridVOLanNetworkQueryOpenApiVO
+	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, fmt.Errorf("omada: decode LAN networks: %w", err)
 	}
-	return result.Data, nil
+	var out []lanNetwork
+	if env.Result != nil && env.Result.Data != nil {
+		for _, n := range *env.Result.Data {
+			id := ""
+			if n.Id != nil {
+				id = *n.Id
+			}
+			out = append(out, lanNetwork{ID: id, Name: n.Name})
+		}
+	}
+	return out, nil
 }
 
 // listLanDNS returns every LAN DNS entry of the configured site.
 func (c *omadaClient) listLanDNS(ctx context.Context) ([]lanDNS, error) {
-	path := c.lanDNSPath()
 	entries := make([]lanDNS, 0)
 	for page := 1; ; page++ {
-		query := url.Values{
-			pageKey:     {strconv.Itoa(page)},
-			pageSizeKey: {strconv.Itoa(lanDNSPageSize)},
+		resp, err := c.cl.Lan().GetGridLanDns(ctx, c.omadaID, c.siteID, &omadalanc.GetGridLanDnsParams{Page: int32(page), PageSize: lanDNSPageSize})
+		if err != nil {
+			return nil, fmt.Errorf("omada: list LAN DNS: %w", err)
 		}
-		var env omadaEnvelope
-		if err := c.do(ctx, http.MethodGet, path, query, nil, &env); err != nil {
+		data, err := decodeEnvelope(resp)
+		if err != nil {
 			return nil, err
 		}
-		var pageResp lanDNSPage
-		if err := json.Unmarshal(env.Result, &pageResp); err != nil {
+		var env omadalanc.OperationResponseLanDnsGridVOLanDnsQueryOpenApiVO
+		if err := json.Unmarshal(data, &env); err != nil {
 			return nil, fmt.Errorf("omada: decode LAN DNS page: %w", err)
 		}
-		entries = append(entries, pageResp.Data...)
-		if len(pageResp.Data) == 0 || len(pageResp.Data) < lanDNSPageSize || len(entries) >= pageResp.TotalRows {
+		var rows []omadalanc.LanDnsQueryOpenApiVO
+		total := 0
+		if env.Result != nil {
+			if env.Result.Data != nil {
+				rows = *env.Result.Data
+			}
+			if env.Result.TotalRows != nil {
+				total = int(*env.Result.TotalRows)
+			}
+		}
+		for _, r := range rows {
+			entries = append(entries, toLanDNS(r))
+		}
+		if len(rows) == 0 || len(rows) < int(lanDNSPageSize) || len(entries) >= total {
 			break
 		}
 	}
@@ -343,122 +283,99 @@ func (c *omadaClient) listLanDNS(ctx context.Context) ([]lanDNS, error) {
 
 func (c *omadaClient) updateLanDNS(ctx context.Context, id string, dns lanDNS) error {
 	dns.LanNetworkIDs = c.lanNetworkIDs
-	path := fmt.Sprintf("%s/%s", c.lanDNSPath(), id)
-	var env omadaEnvelope
-	return c.do(ctx, http.MethodPatch, path, nil, dns, &env)
+	resp, err := c.cl.Lan().ModifyLanDns(ctx, c.omadaID, c.siteID, id, toLanDnsVO(dns))
+	if err != nil {
+		return fmt.Errorf("omada: update LAN DNS: %w", err)
+	}
+	_, err = decodeEnvelope(resp)
+	return err
 }
 
 func (c *omadaClient) deleteLanDNS(ctx context.Context, id string) error {
-	path := fmt.Sprintf("%s/%s", c.lanDNSPath(), id)
-	var env omadaEnvelope
-	return c.do(ctx, http.MethodDelete, path, nil, nil, &env)
+	resp, err := c.cl.Lan().DeleteLanDns(ctx, c.omadaID, c.siteID, id)
+	if err != nil {
+		return fmt.Errorf("omada: delete LAN DNS: %w", err)
+	}
+	_, err = decodeEnvelope(resp)
+	return err
 }
 
 func (c *omadaClient) createLanDNS(ctx context.Context, dns lanDNS) (string, error) {
 	dns.LanNetworkIDs = c.lanNetworkIDs
-	var env omadaEnvelope
-	if err := c.do(ctx, http.MethodPost, c.lanDNSPath(), nil, dns, &env); err != nil {
+	resp, err := c.cl.Lan().CreateLanDns(ctx, c.omadaID, c.siteID, toLanDnsVO(dns))
+	if err != nil {
+		return "", fmt.Errorf("omada: create LAN DNS: %w", err)
+	}
+	data, err := decodeEnvelope(resp)
+	if err != nil {
 		return "", err
 	}
 	// The controller answers successful creates without a result body, so
 	// the entry ID is not always available; the provider re-discovers
 	// entries from the list on the next read.
-	if len(env.Result) == 0 {
-		return "", nil
+	var res struct {
+		Result *struct {
+			ID string `json:"id"`
+		} `json:"result"`
 	}
-	var res createLanDNSResult
-	if err := json.Unmarshal(env.Result, &res); err != nil {
+	if err := json.Unmarshal(data, &res); err != nil {
 		return "", fmt.Errorf("omada: decode created LAN DNS: %w", err)
 	}
-	return res.ID, nil
+	if res.Result == nil {
+		return "", nil
+	}
+	return res.Result.ID, nil
 }
 
-// do performs a request, and on a 401 refreshes the token (falling back to
-// a full re-authorize) and retries the request once. If both re-auth
-// attempts fail, the original 401 error is returned so callers can still
-// match it with errors.Is(err, errNotAuthorized).
-func (c *omadaClient) do(ctx context.Context, method, path string, query url.Values, payload any, result *omadaEnvelope) error {
-	err := c.doOnce(ctx, method, path, query, payload, result)
-	if err == nil || !errors.Is(err, errNotAuthorized) {
-		return err
+// toLanDnsVO renders the internal entry shape as the generated request VO.
+func toLanDnsVO(dns lanDNS) omadalanc.LanDnsOpenApiVO {
+	vo := omadalanc.LanDnsOpenApiVO{
+		Domain: dns.Domain,
+		Name:   dns.Name,
+		Type:   int32(dns.Type),
+		Enable: dns.Enable,
 	}
-	if err := c.refresh(ctx); err != nil {
-		if authErr := c.authorize(ctx); authErr != nil {
-			return err
-		}
+	if len(dns.IPAddresses) > 0 {
+		ips := append([]string(nil), dns.IPAddresses...)
+		vo.IpAddresses = &ips
 	}
-	return c.doOnce(ctx, method, path, query, payload, result)
+	if len(dns.IPv6Addresses) > 0 {
+		ips := append([]string(nil), dns.IPv6Addresses...)
+		vo.Ipv6Addresses = &ips
+	}
+	if dns.Cname != "" {
+		cname := dns.Cname
+		vo.Cname = &cname
+	}
+	if len(dns.LanNetworkIDs) > 0 {
+		nets := append([]string(nil), dns.LanNetworkIDs...)
+		vo.LanNetworkIds = &nets
+	}
+	return vo
 }
 
-func (c *omadaClient) doOnce(ctx context.Context, method, path string, query url.Values, payload any, result *omadaEnvelope) error {
-	req, err := c.newRequest(ctx, method, path, query, payload)
-	if err != nil {
-		return err
+// toLanDNS maps a generated grid row to the internal entry shape.
+func toLanDNS(vo omadalanc.LanDnsQueryOpenApiVO) lanDNS {
+	e := lanDNS{
+		Name:   vo.Name,
+		Domain: vo.Domain,
+		Type:   int(vo.Type),
+		Enable: vo.Enable,
 	}
-	return c.send(req, result)
-}
-
-func (c *omadaClient) newRequest(ctx context.Context, method, path string, query url.Values, payload any) (*http.Request, error) {
-	u := c.baseURL + path
-	if len(query) > 0 {
-		u += "?" + query.Encode()
+	if vo.Id != nil {
+		e.ID = *vo.Id
 	}
-	var body io.Reader
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("omada: encode request: %w", err)
-		}
-		body = bytes.NewReader(data)
+	if vo.IpAddresses != nil {
+		e.IPAddresses = *vo.IpAddresses
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
-	if err != nil {
-		return nil, err
+	if vo.Ipv6Addresses != nil {
+		e.IPv6Addresses = *vo.Ipv6Addresses
 	}
-	if payload != nil {
-		req.Header.Set("Content-Type", contentTypeJSON)
+	if vo.Cname != nil {
+		e.Cname = *vo.Cname
 	}
-	return req, nil
-}
-
-// send executes the request and decodes the envelope. A non-zero
-// errorCode is mapped to a plain error carrying the code and message; a
-// 401, or the token-expired envelope code, is mapped to
-// errNotAuthorized so do() refreshes the token and retries.
-func (c *omadaClient) send(req *http.Request, result *omadaEnvelope) error {
-	c.mu.Lock()
-	token := c.accessToken
-	c.mu.Unlock()
-	if token != "" {
-		req.Header.Set("Authorization", "AccessToken="+token)
+	if vo.LanNetworkIds != nil {
+		e.LanNetworkIDs = *vo.LanNetworkIds
 	}
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("omada: %s %s: %w", req.Method, req.URL.Path, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusUnauthorized {
-		return errNotAuthorized
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("omada: %s %s: unexpected status %d", req.Method, req.URL.Path, resp.StatusCode)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("omada: read response: %w", err)
-	}
-	if err := json.Unmarshal(data, result); err != nil {
-		return fmt.Errorf("omada: decode response: %w", err)
-	}
-	if result.ErrorCode == errCodeTokenExpired {
-		return errNotAuthorized
-	}
-	if result.ErrorCode != 0 {
-		return fmt.Errorf("omada error %d: %s", result.ErrorCode, result.Msg)
-	}
-	return nil
-}
-
-func (c *omadaClient) lanDNSPath() string {
-	return fmt.Sprintf("/openapi/v1/%s/sites/%s/setting/lan/dns", c.omadaID, c.siteID)
+	return e
 }
