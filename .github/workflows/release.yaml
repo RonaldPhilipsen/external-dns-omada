@@ -25,7 +25,7 @@ jobs:
 
       - name: Calculate version
         id: semVersie
-        uses: RonaldPhilipsen/semVersie@41233349edfb40f4e6da4251fea7684026182dc9 # v2.3.4
+        uses: RonaldPhilipsen/semVersie@61a735e7d9e3d6e258d3288d09c1289a5a23ca69 # v2.3.5
 
   release:
     if: ${{ needs.version.outputs.release == 'true' || needs.version.outputs.prerelease == 'true' }}
