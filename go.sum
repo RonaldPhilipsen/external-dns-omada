@@ -3,6 +3,8 @@ github.com/Masterminds/semver/v3 v3.4.0/go.mod h1:4V+yj/TJE1HU9XfppCwVMZq3I84lpr
 github.com/RaveNoX/go-jsoncommentstrip v1.0.0/go.mod h1:78ihd09MekBnJnxpICcwzCMzGrKSKYe4AqU6PDYYpjk=
 github.com/RonaldPhilipsen/omada v0.2.1 h1:/dxOJXKuN16qkOi+RnJ24TVsAVHaeEHfG73d386K+9w=
 github.com/RonaldPhilipsen/omada v0.2.1/go.mod h1:XMS6pDADUApyAXjPYVhhymBhFjdewxlQE/oCCen1D9I=
+github.com/RonaldPhilipsen/omada v0.2.2 h1:sHD1XWn+e8Zi4DFH1VOrqXlVcPtQFVG8LvsAXcG/D5I=
+github.com/RonaldPhilipsen/omada v0.2.2/go.mod h1:XMS6pDADUApyAXjPYVhhymBhFjdewxlQE/oCCen1D9I=
 github.com/alecthomas/kingpin/v2 v2.4.0 h1:f48lwail6p8zpO1bC4TxtqACaGqHYA22qkHjHpqDjYY=
 github.com/alecthomas/kingpin/v2 v2.4.0/go.mod h1:0gyi0zQnjuFk8xrkNKamJoyUo382HRL7ATRpFZCw6tE=
 github.com/alecthomas/units v0.0.0-20240927000941-0f3dac36c52b h1:mimo19zliBX/vSQ6PWWSL9lK8qwHozUj03+zLoEB8O0=
