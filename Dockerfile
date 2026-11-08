@@ -20,3 +20,15 @@ FROM gcr.io/distroless/static:nonroot@sha256:25ac8f0c3b2334a9eb05452266bd4697864
 COPY --from=build /out/external-dns-omada /usr/local/bin/external-dns-omada
 EXPOSE 8080 8888
 ENTRYPOINT ["/usr/local/bin/external-dns-omada"]
+
+# OCI image labels. Keep this block last so that changed values only rebuild this step.
+ARG VERSION=devel
+ARG GIT_SHA=unknown
+LABEL \
+    org.opencontainers.image.title="external-dns-omada" \
+    org.opencontainers.image.description="External DNS provider for TP-link omada controllers" \
+    org.opencontainers.image.url="https://github.com/RonaldPhilipsen/external-dns-omada" \
+    org.opencontainers.image.source="https://github.com/RonaldPhilipsen/external-dns-omada" \
+    org.opencontainers.image.licenses="MIT" \
+    org.opencontainers.image.version="${VERSION}" \
+    org.opencontainers.image.revision="${GIT_SHA}"
