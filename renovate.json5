@@ -17,11 +17,18 @@
   packageRules: [
     {
       description: [
-        'Auto-merge all updates from my own packages',
+        'Auto-merge non-major updates from my own packages',
       ],
       matchPackageNames: [
         'ghcr.io/ronaldphilipsen/**',
         'ronaldphilipsen/**',
+      ],
+      matchUpdateTypes: [
+        'minor',
+        'patch',
+        'digest',
+        'pin',
+        'pinDigest',
       ],
       automerge: true,
     },
