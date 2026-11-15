@@ -3,7 +3,7 @@ module github.com/RonaldPhilipsen/external-dns-omada
 go 1.27.3
 
 require (
-	github.com/RonaldPhilipsen/omada v0.2.3
+	github.com/RonaldPhilipsen/omada v0.3.0
 	github.com/prometheus/client_golang v1.25.0
 	github.com/sirupsen/logrus v1.10.2
 	github.com/stretchr/testify v1.12.1
