@@ -2,7 +2,7 @@
 
 # Build the webhook provider binary from source. golang:1.27 because
 # sigs.k8s.io/external-dns v0.23.0 requires go >= 1.27.
-FROM golang:1.27@sha256:3102e2c7eeee6e16de01ca3f35c56434696f70702a30b3d564b0244560981bb0 AS build
+FROM golang:1.27@sha256:87f49b77a7b6a99ad7dc656be010ae453322459dd2ed902ac177649a302bc101 AS build
 ARG VERSION=devel
 ARG GIT_SHA=unknown
 WORKDIR /src
